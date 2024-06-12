@@ -2,6 +2,7 @@ import os
 import json
 import engine
 import logging
+from collections import OrderedDict
 from util.qartod_service import qartodTestServiceAPI
 from ioos_qc.config import QcConfig
 
@@ -40,6 +41,7 @@ class QartodQcExecutor(object):
         :param dataset: xarray.Dataset holding the science data the QARTOD test evaluates
         :return:
         """
+        is_2d_array = False
         # Extract configuration details for test inputs referring to dataset variables
         params = qartod_test_record.parameters
         # single quoted strings in parameters (i.e. from the database field) will mess up the json.loads call
@@ -54,17 +56,6 @@ class QartodQcExecutor(object):
         parameter_under_test = param_dict['inp']
         # can't run test on data that's not there
         if parameter_under_test not in dataset:
-            return
-
-        # Extract configuration details for remaining test inputs
-        config = qartod_test_record.qcConfig
-        # single quoted strings in qcConfig (i.e. from the database field) will mess up the json.loads call
-        config = config.replace("'", "\"")
-        try:
-            qc_config = QcConfig(json.loads(config))
-        except ValueError:
-            log.error('<%s> Failure deserializing QC test configuration %r for parameter %r', self.request_id,
-                      config, parameter_under_test)
             return
 
         # need to account for external parameters (i.e. depth) for some qartod tests
@@ -93,7 +84,40 @@ class QartodQcExecutor(object):
             log.error('<%s> Failure reading QARTOD test parameter %r. Skipping test.', self.request_id,
                       param_name)
             return
-               
+       
+        # Extract configuration details for remaining test inputs
+        config = qartod_test_record.qcConfig
+        # single quoted strings in qcConfig (i.e. from the database field) will mess up the json.loads call
+        config = config.replace("'", "\"")
+
+        if len(param_dict['inp'].shape) > 1:
+            is_2d_array=True
+        qc_configs = [] 
+        try:
+            json_config = json.loads(config)
+            results = OrderedDict()
+            if is_2d_array:      
+                for modu, tests in json_config.items():
+                    results[modu] = OrderedDict()
+                    for testname, kwargs in tests.items():
+                        if testname == 'gross_range_test':
+                            suspect_values = kwargs['suspect_span']
+                            fail_values = kwargs['fail_span']
+
+                            qc_configs.extend(
+                                QcConfig({modu: {testname: {'suspect_span': suspect, 'fail_span': fail}}})
+                                for suspect, fail in zip(suspect_values, fail_values)
+                            )
+
+                        elif testname == 'climatology_test':
+                            qc_config = QcConfig(json_config)
+            else:
+                qc_config = QcConfig(json_config)
+        except ValueError:
+            log.error('<%s> Failure deserializing QC test configuration %r for parameter %r', self.request_id,
+                    config, parameter_under_test)
+            return                
+
         if 'tinp' in param_dict.keys():
             # Seconds from NTP epoch to UNIX epoch           
             NTP_OFFSET_SECS = 2208988800
@@ -105,6 +129,7 @@ class QartodQcExecutor(object):
         read_fd, write_fd = os.pipe()
         processid = os.fork()
         if processid == 0:
+            results = []
             # child process
             with os.fdopen(write_fd, 'w') as w:
                 os.close(read_fd)
@@ -112,7 +137,24 @@ class QartodQcExecutor(object):
                 try:
                     # all arguments except the data under test come from the configuration object
                     # results is a nested dictionary
-                    results = qc_config.run(**param_dict)
+                    if is_2d_array:
+                        sub_param_dict = {}
+                        #gross range 2D contains multiple qc_configs, need to run them each individually
+                        if qc_configs:
+                            for counter, qc_config in enumerate(qc_configs):
+                                sub_param_dict['inp'] = np.array([value[counter] for value in param_dict['inp']])
+                                sub_results = qc_config.run(**sub_param_dict)
+                                results.append(sub_results)
+                        #climatology uses zinp parameter to         
+                        elif 'zinp' in param_dict:
+                            for counter, zinp in enumerate(param_dict['zinp']):
+                                sub_param_dict['inp'] = np.array([value[counter] for value in param_dict['inp']])
+                                sub_param_dict['zinp'] = zinp
+                                sub_param_dict['tinp'] = param_dict['tinp']
+                                sub_results = qc_config.run(**sub_param_dict)
+                                results.append(sub_results)
+                    else:
+                        results.append(qc_config.run(**param_dict))
                     # convert results into a string for sending over pipe
                     # NOTE: this converts numpy arrays to lists! Use np.asarray() to restore them.
                     results_string = json.dumps(results, cls=NumpyEncoder)
@@ -146,22 +188,32 @@ class QartodQcExecutor(object):
         # results is a nested dictionary with the outer keys being module names, the inner keys being test
         # names, and the inner values being the results for the given test
         # e.g. {'qartod': {'gross_range_test': [0, 0, 3, 4, 0], 'location_test': [2, 2, 2, 2, 2]}}
-        for module, test_set in results.items():
-            for test, test_results in test_set.items():
-                # test_results was converted from an np.array to a list during serialization, so convert it back
-                test_results = np.asarray(test_results)
-                
-                # Verify all QC results are valid QARTOD Primary Level Flags
-                mask = np.array([item not in QartodFlags.getValidQCFlags() for item in test_results])
+        all_test_results = []
+        for result_item in results:
+            for module, test_set in result_item.items():
+                for test, test_results in test_set.items():
+                    # test_results was converted from an np.array to a list during serialization, so convert it back
+                   
+                    test_results = np.asarray(test_results)
+                    
+                    # Verify all QC results are valid QARTOD Primary Level Flags
+                    mask = np.array([item not in QartodFlags.getValidQCFlags() for item in test_results])
 
-                if mask.any():
-                    log.error('Received QC result with invalid QARTOD Primary Flag from %s. Invalid flags: %r',
-                              test, np.unique(test_results[mask]))
-                    # Use the "high interest" (SUSPECT) flag to draw attention to the failure
-                    test_results[mask] = QartodFlags.SUSPECT
-
-                # add results to dataset
-                QartodQcExecutor.insert_qc_results(parameter_under_test, test, test_results, dataset)
+                    if mask.any():
+                        log.error('Received QC result with invalid QARTOD Primary Flag from %s. Invalid flags: %r',
+                                test, np.unique(test_results[mask]))
+                        # Use the "high interest" (SUSPECT) flag to draw attention to the failure
+                        test_results[mask] = QartodFlags.SUSPECT
+                    all_test_results.append(test_results)
+ 
+                    # add results to dataset
+                    #QartodQcExecutor.insert_qc_results(parameter_under_test, test, all_test_results, dataset)
+        all_test_results = np.array(all_test_results)
+        all_test_results = np.squeeze(all_test_results)
+        test_results = all_test_results.T   
+       
+        test_results = np.asarray(test_results)
+        QartodQcExecutor.insert_qc_results(parameter_under_test, test, test_results, dataset)
 
     @staticmethod
     def insert_qc_results(parameter, test, results, dataset):
@@ -184,7 +236,7 @@ class QartodQcExecutor(object):
         # In rare cases, a parameter may have a dimension other than 'obs'. Normally, dataset[parameter].dims would be
         # a tuple potentially containing multiple dimensions, but we previously checked the data is 1-dimensional,
         # so the tuple must contain only 1 dimension
-        qc_obs_dimension = dataset[parameter].dims[0]
+        qc_obs_dimension = dataset[parameter].dims
 
         # try to get the standard_name if its set, but default to the parameter name otherwise
         parameter_standard_name = dataset[parameter].attrs.get('standard_name', parameter)
@@ -253,3 +305,4 @@ class QartodQcExecutor(object):
 
             # update the attributes to detail which tests were run (and in what order)
             dataset[qartod_secondary_flag_name].attrs['tests_executed'] += ', ' + test
+
