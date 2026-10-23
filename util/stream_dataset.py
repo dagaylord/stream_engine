@@ -1,6 +1,6 @@
 import datetime
 import importlib
-import inspect
+from inspect import signature
 import json
 import logging
 import sys
@@ -44,7 +44,10 @@ from util.metadata_service import (
 )
 from util.provenance_metadata_store import ProvenanceMetadataStore
 from util.san import fetch_full_san_data, fetch_nsan_data, get_san_lookback_dataset
-from util.xray_interpolation import interp1d_data_array
+from util.xray_interpolation import (
+    interp1d_data_array,
+    interp2d_data_array,
+)
 
 log = logging.getLogger(__name__)
 
@@ -77,6 +80,9 @@ class StreamDataset(object):
     def fetch_raw_data(self, time_range, limit, should_pad):
         deployment_datasets = self.get_dataset(time_range, limit, self.provenance_metadata,
                                                should_pad, self.request_id)
+        if not deployment_datasets:
+            raise MissingDataException("Query returned no results for stream %s" % self.stream_key)
+
         for deployment, dataset in deployment_datasets.items():
             if self.raw_data_only:
                 self.datasets[deployment] = dataset
@@ -88,24 +94,20 @@ class StreamDataset(object):
         Insert the supplied dataset into this StreamDataset
         This method should not be called twice, it will replace existing data if called again.
         """
-        if dataset:
-            # RSN data shall obtain deployment information from asset management.
-            # Replace these values prior to grouping with the actual deployment number
-            if self.events and self.stream_key.method.startswith('streamed'):
-                for deployment_number in sorted(self.events.deps):
-                    mask = dataset.time.values > self.events.deps[deployment_number].ntp_start
-                    dataset.deployment.values[mask] = deployment_number
+        # RSN data shall obtain deployment information from asset management.
+        # Replace these values prior to grouping with the actual deployment number
+        if self.events and self.stream_key.method.startswith('streamed'):
+            for deployment_number in sorted(self.events.deps):
+                mask = dataset.time.values > self.events.deps[deployment_number].ntp_start
+                dataset.deployment.values[mask] = deployment_number
 
-            for deployment, group in dataset.groupby('deployment'):
-                if STREAM_DEDUPLICATION_MAP and self.stream_key.stream.name in STREAM_DEDUPLICATION_MAP:
-                    # If the stream key is in the deduplication map, prune duplicates
-                    self.datasets[deployment] = self._prune_duplicates(group, STREAM_DEDUPLICATION_MAP[self.stream_key.stream.name])
-                else:
-                    self.datasets[deployment] = self._prune_duplicate_times(group)
-                self.params[deployment] = [p for p in self.stream_key.stream.derived]
-
-        else:
-            raise MissingDataException("Query returned no results for stream %s" % self.stream_key)
+        for deployment, group in dataset.groupby('deployment'):
+            if STREAM_DEDUPLICATION_MAP and self.stream_key.stream.name in STREAM_DEDUPLICATION_MAP:
+                # If the stream key is in the deduplication map, prune duplicates
+                self.datasets[deployment] = self._prune_duplicates(group, STREAM_DEDUPLICATION_MAP[self.stream_key.stream.name])
+            else:
+                self.datasets[deployment] = self._prune_duplicate_times(group)
+            self.params[deployment] = [p for p in self.stream_key.stream.derived]
 
     @staticmethod
     def _prune_duplicate_times(dataset):
@@ -407,24 +409,19 @@ class StreamDataset(object):
                        param, param.parameter_function.function, param.parameter_function.owner))
             return False
 
-        # Get the argument specification for the actual function
-        arg_spec = inspect.getargspec(getattr(module, param.parameter_function.function))
+        # Get the signature of the actual function
+        sig = signature(getattr(module, param.parameter_function.function))
 
         for arg_name in missing_arg_map.keys():
             # Ensure the parameter is named as an argument in the actual function
-            if arg_name not in arg_spec.args:
-                log.error('%r: Named parameter %s not found in function %s' % (
+            p = sig.parameters.get(arg_name, None)
+            if not p:
+                log.error('%r: Named parameter %s not found in signature of function %s' % (
                            param, arg_name, param.parameter_function.function))
                 return False
 
-            # Ensure the function has defaults
-            if not arg_spec.defaults:
-                log.debug('%r: Function %s does not have any defaults' % (
-                           param, param.parameter_function.function))
-                return False
-
             # Ensure the argument has a default specified in the function definition
-            if arg_spec.args.index(arg_name) < len(arg_spec.args) - len(arg_spec.defaults):
+            if p.default is p.empty:
                 log.debug('%r: Argument %s in function %s does not have a default value' % (
                            param, arg_name, param.parameter_function.function))
                 return False
@@ -682,8 +679,8 @@ class StreamDataset(object):
                     and (required_deployment is None or deployment == required_deployment)]
         if datasets:
             shape = datasets[0][name].shape
-            if len(shape) != 1:
-                raise StreamEngineException('<%s> Attempted to interpolate >1d data (%s): %s' %
+            if len(shape) > 2:
+                raise StreamEngineException('<%s> Attempted to interpolate >2d data (%s): %s' %
                                             (self.request_id, name, shape))
 
             # Two possible choices here.
@@ -694,16 +691,28 @@ class StreamDataset(object):
             for dataset in datasets:
                 ds_start, ds_end = dataset.time.values[0], dataset.time.values[-1]
                 if len(datasets) == 1 or (ds_start <= start and ds_end >= end):
-                    return interp1d_data_array(dataset.time.values,
+                    if len(shape) == 1:
+                        return interp1d_data_array(dataset.time.values,
+                                               dataset[name],
+                                               time=target_times)
+                    elif len(shape) == 2:
+                        dim2_name = dataset[name].dims[1]
+                        return interp2d_data_array((dataset.time.values, dataset[dim2_name].values),
                                                dataset[name],
                                                time=target_times)
 
             # No single deployment contains this data. Create a temporary dataset containing all
             # deployments which contain data for the target parameter, then interpolate
             ds = compile_datasets(datasets)
-            return interp1d_data_array(ds.time.values,
-                                       ds[name],
-                                       time=target_times)
+            if len(shape) == 1:
+                return interp1d_data_array(ds.time.values,
+                                           ds[name],
+                                           time=target_times)
+            elif len(shape) == 2:
+                dim2_name = ds[name].dims[1]
+                return interp2d_data_array((ds.time.values, ds[dim2_name].values),
+                                           ds[name],
+                                           time=target_times)
 
     def _get_external_stream_key(self, external_stream_name):
         """
