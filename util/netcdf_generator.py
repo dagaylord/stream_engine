@@ -191,10 +191,7 @@ class NetcdfGenerator(object):
                                             final_qartod_var = anc_var.replace(alt_var, parameter.netcdf_name, 1)
                                             ds = ds.rename({current_qartod_var: final_qartod_var})
                                             params_to_include.append(final_qartod_var)
-                                            # ds = ds.rename({
-                                            #     anc_var_renamed: anc_var.replace(anc_var_renamed, parameter.netcdf_name, 1)
-                                            # })
-                                            
+                                          
                                     ds[long_parameter_name].attrs['ancillary_variables'] = anc_vars.replace(
                                         long_parameter_name, parameter.netcdf_name
                                     )
